@@ -9,7 +9,7 @@ router.get('/:uuid', async (req, res) => {
             return res.render('download', { error: 'Link has been expired.'});
         } 
         // return res.render('download', { uuid: file.uuid, fileName: file.filename, fileSize: file.size, downloadLink: `${process.env.APP_BASE_URL}/files/download/${file.uuid}` });
-        return res.render('download', { uuid: file.uuid, fileName: file.filename, fileSize: file.size, downloadLink: `${process.env.LIVE_APP_BASE_URL}/files/download/${file.uuid}` });
+        return res.render('download', { uuid: file.uuid, fileName: file.filename, fileSize: file.size, downloadLink: `https://file-share-app-backend.onrender.com/files/download/${file.uuid}` });
     } catch(err) {
         return res.render('download', { error: 'Something went wrong.'});
     }
