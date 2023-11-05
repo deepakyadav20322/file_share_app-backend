@@ -1,4 +1,5 @@
 module.exports = ({emailFrom, downloadLink, size, expires}) => {
+    console.log("download Link again -> ",downloadLink)
     return `
         <!doctype html>
             <html>
