@@ -15,7 +15,6 @@ let storage = multer.diskStorage({
 let upload = multer({ storage, limits:{ fileSize: 1000000 * 100 }, }).single('myfile'); //100mb
 
 router.post('/', (req, res) => {
-  
     upload(req, res, async (err) => {
       if (err) {
         
@@ -42,9 +41,8 @@ router.post('/send', async (req, res) => {
   }
   // Get data from db 
   try {
-    console.log('000000000000000000000')
+ 
     const file = await File.findOne({ uuid: uuid });
-    console.log(file,"kkkkkkkkkkkkkkkkkkkk")
     const sender = file.receiver
     console.log(sender)
     if(sender) {
@@ -63,7 +61,7 @@ router.post('/send', async (req, res) => {
       text: `${emailFrom} shared a file with you.`,
       html: require('../services/emailTemplate')({
                 emailFrom, 
-                downloadLink: `${process.env.LIVE_APP_BASE_URL}/${file.uuid}?source=email` ,
+                downloadLink: `${process.env.LIVE_APP_BASE_URL}/files/${file.uuid}?source=email` ,
                 size: parseInt(file.size/1000) + ' KB',
                 expires: '24 hours'
             })
