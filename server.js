@@ -28,7 +28,13 @@ app.set('view engine', 'ejs');
 app.use('/api/files', require('./routes/files'));
 app.use('/files', require('./routes/show'));
 app.use('/files/download', require('./routes/download'));
+app.set('trust proxy', 1);
 
+app.use('/api/transfer', require('./routes/transfer'));
+app.use('/api/stats',    require('./routes/stats'));
+app.use('/api/contact',  require('./routes/contact'));
+app.use('/api/auth',     require('./routes/auth'));
+app.use('/api/admin',    require('./routes/admin'));
 
 //--------------------------  Logic for Delete 24 hours old uploaded files  ------------------------------------//
 const File = require('./models/file');
