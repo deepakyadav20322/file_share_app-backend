@@ -1,4 +1,10 @@
-module.exports = ({emailFrom, downloadLink, size, expires}) => {
+const { escapeHtml: e } = require('./abuseGuard');
+
+module.exports = (raw) => {
+    // Every value is escaped: they come from visitors, so they must never be able to add markup or links.
+    const emailFrom = e(raw.emailFrom), downloadLink = e(raw.downloadLink), size = e(raw.size), expires = e(raw.expires);
+    // Link back to the site in the footer (from .env, never from the visitor).
+    const site = e((process.env.FRONTEND_URL || 'https://sendanyfile.xyz').trim().replace(/\/$/, ''));
     
     return `
         <!doctype html>
@@ -6,7 +12,7 @@ module.exports = ({emailFrom, downloadLink, size, expires}) => {
             <head>
                 <meta name="viewport" content="width=device-width">
                 <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
-                <title>Simple Transactional Email</title>
+                <title>SendAnyFile</title>
                 <style>
                 /* -------------------------------------
                     INLINED WITH htmlemail.io/inline
@@ -116,6 +122,7 @@ module.exports = ({emailFrom, downloadLink, size, expires}) => {
                                 <td style="font-family: sans-serif; font-size: 14px; vertical-align: top;">
                                     <p style="font-family: sans-serif; font-size: 14px; font-weight: normal; margin: 0; Margin-bottom: 15px;">Hi there,</p>
                                     <p style="font-family: sans-serif; font-size: 14px; font-weight: normal; margin: 0; Margin-bottom: 15px;"><b>${emailFrom}</b> has shared a file with you.</p>
+                                    <p style="font-family: sans-serif; font-size: 12px; color: #777777; font-weight: normal; margin: 0; Margin-bottom: 15px;">SendAnyFile does not verify who the sender is. Only open files from people you know.</p>
                                     <p style="font-family: sans-serif; font-size: 14px; font-weight: normal; margin: 0; Margin-bottom: 15px;">${size} in total ・ Expires in ${expires}</p>
                                     <table border="0" cellpadding="0" cellspacing="0" class="btn btn-primary" style="border-collapse: separate; mso-table-lspace: 0pt; mso-table-rspace: 0pt; width: 100%; box-sizing: border-box;">
                                     <tbody>
@@ -132,8 +139,7 @@ module.exports = ({emailFrom, downloadLink, size, expires}) => {
                                         </tr>
                                     </tbody>
                                     </table>
-                                    <p style="font-family: sans-serif; font-size: 14px; font-weight: normal; margin: 0; Margin-bottom: 15px;">Thank you for using DocWave service.</p>
-                                    <p style="font-family: sans-serif; font-size: 14px; font-weight: normal; margin: 0; Margin-bottom: 15px;">Good luck! Hope it works.</p>
+                                    <p style="font-family: sans-serif; font-size: 14px; font-weight: normal; margin: 0; Margin-bottom: 15px;">Thank you for using SendAnyFile service.</p>
                                 </td>
                                 </tr>
                             </table>
@@ -148,13 +154,7 @@ module.exports = ({emailFrom, downloadLink, size, expires}) => {
                         <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate; mso-table-lspace: 0pt; mso-table-rspace: 0pt; width: 100%;">
                             <tr>
                             <td class="content-block" style="font-family: sans-serif; vertical-align: top; padding-bottom: 10px; padding-top: 10px; font-size: 12px; color: #999999; text-align: center;">
-                                <span class="apple-link" style="color: #999999; font-size: 12px; text-align: center;">DocWave inc. main street 29, Moscow</span>
-                                <br> Want to share a file? <a href="http://localhost:3000" style="text-decoration: underline; color: #999999; font-size: 12px; text-align: center;">DocWave</a>.
-                            </td>
-                            </tr>
-                            <tr>
-                            <td class="content-block powered-by" style="font-family: sans-serif; vertical-align: top; padding-bottom: 10px; padding-top: 10px; font-size: 12px; color: #999999; text-align: center;">
-                                Powered by <a href="https://www.youtube.com/channel/UCo9xTRmg1SqQ5JSsA2fAgJ" style="color: #999999; font-size: 12px; text-align: center; text-decoration: none;">DocWave</a>.
+                                Want to share a file? <a href="${site}" style="text-decoration: underline; color: #999999; font-size: 12px; text-align: center;">SendAnyFile</a>
                             </td>
                             </tr>
                         </table>
