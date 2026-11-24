@@ -1,5 +1,19 @@
 .env
+# Files people upload (never commit them)
 uploads/*
-# !uploads/.gitkeep
+!uploads/.gitkeep
 node_modules
 .DS_Store
+
+# Secrets: every .env file except the example
+.env.*
+!.env.example
+
+# Logs, test output, editor and OS files
+*.log
+logs
+coverage
+.vscode/*
+!.vscode/extensions.json
+.idea
+Thumbs.db

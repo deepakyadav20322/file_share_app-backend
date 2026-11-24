@@ -8,7 +8,10 @@ const {
   UploadPartCommand,
   CompleteMultipartUploadCommand,
   AbortMultipartUploadCommand,
+  ListPartsCommand,
+  HeadObjectCommand,
 } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const bucket = process.env.S3_BUCKET;
 const prefix = process.env.S3_PREFIX || 'transfers/';
@@ -104,9 +107,78 @@ module.exports = {
     onProgress?.(buffer.length);
   },
 
+  // Short-lived signed link to download one file straight from S3. It always saves as a file with its real
+  // name (never opens in the browser) and is not cached. Valid only for `expiresIn` seconds to START a download.
+  async downloadUrl(storageKey, fileName, mimeType, expiresIn) {
+    const ascii = fileName.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+    const utf8 = encodeURIComponent(fileName).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+    return getSignedUrl(
+      client,
+      new GetObjectCommand({
+        Bucket: bucket,
+        Key: prefix + storageKey,
+        ResponseContentDisposition: `attachment; filename="${ascii}"; filename*=UTF-8''${utf8}`,
+        ResponseContentType: mimeType || 'application/octet-stream',
+        ResponseCacheControl: 'private, no-store',
+      }),
+      { expiresIn }
+    );
+  },
+
   async read(storageKey) {
     const res = await client.send(new GetObjectCommand({ Bucket: bucket, Key: prefix + storageKey }));
     return res.Body;
+  },
+
+  // ---- Direct upload: the browser sends the bytes straight to S3 with signed part links ----------------
+  partSize: PART_SIZE,
+
+  // Starts a multipart upload and returns signed PUT links, one per 5 MB part (the last part may be smaller).
+  // Each link is valid for `expiresIn` seconds and only for its own part of this one upload.
+  async startDirect(storageKey, size, mimeType, expiresIn) {
+    const Key = prefix + storageKey;
+    const { UploadId } = await client.send(
+      new CreateMultipartUploadCommand({ Bucket: bucket, Key, ContentType: mimeType || 'application/octet-stream' })
+    );
+    const count = Math.max(1, Math.ceil(size / PART_SIZE));
+    const parts = [];
+    for (let n = 1; n <= count; n++) {
+      const url = await getSignedUrl(client, new UploadPartCommand({ Bucket: bucket, Key, UploadId, PartNumber: n }), { expiresIn });
+      parts.push({ partNumber: n, size: Math.min(PART_SIZE, size - (n - 1) * PART_SIZE), url });
+    }
+    return { uploadId: UploadId, parts };
+  },
+
+  // Joins the parts once every part S3 received has exactly the expected size; anything else is
+  // thrown away. Returns the final object size from S3 (checked again before the transfer is created).
+  async finishDirect(storageKey, uploadId, expectedSizes) {
+    const Key = prefix + storageKey;
+    const listed = await client.send(new ListPartsCommand({ Bucket: bucket, Key, UploadId: uploadId, MaxParts: 1000 }));
+    const got = (listed.Parts || []).slice().sort((a, b) => a.PartNumber - b.PartNumber);
+    const ok =
+      got.length === expectedSizes.length && got.every((p, i) => p.PartNumber === i + 1 && p.Size === expectedSizes[i]);
+    if (!ok) {
+      await this.abortDirect(storageKey, uploadId);
+      const e = new Error('Uploaded parts do not match the declared file.');
+      e.code = 'PART_MISMATCH';
+      throw e;
+    }
+    await client.send(
+      new CompleteMultipartUploadCommand({
+        Bucket: bucket,
+        Key,
+        UploadId: uploadId,
+        MultipartUpload: { Parts: got.map((p) => ({ ETag: p.ETag, PartNumber: p.PartNumber })) },
+      })
+    );
+    const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key }));
+    return head.ContentLength;
+  },
+
+  async abortDirect(storageKey, uploadId) {
+    await client
+      .send(new AbortMultipartUploadCommand({ Bucket: bucket, Key: prefix + storageKey, UploadId: uploadId }))
+      .catch(() => {});
   },
 
   async remove(storageKey) {

@@ -1,6 +1,9 @@
 const router = require('express').Router();
 const multer = require('multer');
-const archiver = require('archiver');
+const archiverLib = require('archiver');
+// archiver 7 exports a function, archiver 8 exports classes; support both.
+const createZip = (options) =>
+  typeof archiverLib === 'function' ? archiverLib('zip', options) : new archiverLib.ZipArchive(options);
 const path = require('path');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
@@ -8,10 +11,12 @@ const Transfer = require('../models/transfer');
 const limits = require('../config/limits');
 const storage = require('../services/storage');
 const rateLimit = require('../services/rateLimit');
+const { clientKey } = rateLimit;
 const capacity = require('../services/capacity');
 const guard = require('../services/abuseGuard');
 const settings = require('../services/settings');
 const uploadProgress = require('../services/uploadProgress');
+const PendingUpload = require('../models/pendingUpload');
 
 const MB = 1024 * 1024;
 const fmtMB = (bytes) => `${+(bytes / MB).toFixed(2)} MB`;
@@ -124,12 +129,149 @@ router.get('/config', async (req, res) => {
     maxExpiryMinutes: limits.maxExpiryMinutes,
     blockedExtensions: limits.blockedExtensions,
     storage: storage.current(), // 's3' means saving takes a second step after the upload
+    directUpload: storage.current() === 's3', // browser uploads straight to S3 (see /direct/* below)
   });
 });
 
 // How much of the saving step is done (0-100). Unknown ids answer 0.
 router.get('/progress/:id', progressLimiter, (req, res) => {
   res.json({ percent: uploadProgress.percent(req.params.id) ?? 0 });
+});
+
+// ---------------------------------------------------------------------------------------------------
+// Direct upload (S3 only): the browser sends the file bytes straight to S3, so the server never holds
+// them. 1) /direct/start checks the files and returns signed part links, 2) the browser uploads the parts,
+// 3) /direct/complete checks what arrived and creates the transfer. /direct/abort cancels.
+// ---------------------------------------------------------------------------------------------------
+const LINK_SECONDS = 30 * 60; // signed part links stay valid long enough for a slow connection
+const sha256 = (v) => crypto.createHash('sha256').update(String(v)).digest('hex');
+const directLimiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
+
+// Same rules as the normal upload, applied to the file list the browser declares.
+function checkDeclared(body) {
+  const list = Array.isArray(body?.files) ? body.files : [];
+  if (!list.length) return { status: 400, error: 'Please add at least one file.' };
+  if (list.length > limits.maxFiles) return { status: 413, error: `You can send at most ${limits.maxFiles} files at a time.` };
+
+  const files = [];
+  for (const f of list) {
+    const name = guard.safeFileName(typeof f?.name === 'string' ? f.name : '');
+    const size = Number(f?.size);
+    if (!name || !Number.isInteger(size) || size < 0) return { status: 400, error: 'This upload is not valid.' };
+    if (size === 0) return { status: 400, error: `${name} is empty.` };
+    if (guard.isBlockedName(name)) return { status: 415, error: `Files of type .${guard.extensionOf(name)} are not allowed.` };
+    if (size > limits.maxFileSize) return { status: 413, error: `Each file must be ${fmtMB(limits.maxFileSize)} or smaller.` };
+    files.push({ name, size, mimeType: guard.safeMime(typeof f?.type === 'string' ? f.type : '') });
+  }
+  const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+  if (totalSize > limits.maxTotalSize) return { status: 413, error: `Total size must be ${fmtMB(limits.maxTotalSize)} or smaller.` };
+
+  const rawExpiry = body.expiryMinutes;
+  const expiryMinutes = rawExpiry === undefined ? limits.defaultExpiryMinutes : Number(rawExpiry);
+  if (!Number.isInteger(expiryMinutes) || expiryMinutes < 1 || expiryMinutes > limits.maxExpiryMinutes) {
+    return { status: 400, error: `Expiry must be between 1 minute and ${limits.maxExpiryMinutes / 60} hours.` };
+  }
+  const rawDl = body.maxDownloads;
+  const maxDownloads = rawDl === undefined ? limits.defaultDownloads : /^[1-5]$/.test(String(rawDl)) ? Number(rawDl) : NaN;
+  if (!Number.isInteger(maxDownloads) || maxDownloads > limits.maxDownloads) {
+    return { status: 400, error: `Downloads must be a number from 1 to ${limits.maxDownloads}.` };
+  }
+  return { files, totalSize, expiryMinutes, maxDownloads };
+}
+
+router.post('/direct/start', uploadLimiter, async (req, res) => {
+  if (storage.current() !== 's3') return res.status(400).json({ error: 'Direct upload is not available.' });
+  if (!(await settings.get('uploadsEnabled'))) {
+    return res.status(503).json({ error: 'Sending is paused for maintenance. Please try again soon.' });
+  }
+  const checked = checkDeclared(req.body);
+  if (checked.error) return res.status(checked.status).json({ error: checked.error });
+
+  // Room check, counting uploads that are still in progress too.
+  const [pending] = await PendingUpload.aggregate([{ $group: { _id: null, b: { $sum: '$totalSize' } } }]);
+  const release = await capacity.reserve(checked.totalSize + (pending?.b || 0));
+  if (!release) return res.status(503).json({ error: 'SendAnyFile is full at the moment. Please try again later.' });
+  release();
+
+  const provider = storage.get('s3');
+  const started = [];
+  try {
+    const answer = [];
+    for (const f of checked.files) {
+      const ext = path.extname(f.name).toLowerCase();
+      const storageKey = `${uuidv4()}${/^\.[a-z0-9]{1,10}$/.test(ext) ? ext : ''}`;
+      const { uploadId, parts } = await provider.startDirect(storageKey, f.size, f.mimeType, LINK_SECONDS);
+      started.push({ ...f, storageKey, uploadId });
+      answer.push({ parts });
+    }
+    const token = crypto.randomBytes(24).toString('base64url');
+    await PendingUpload.create({
+      tokenHash: sha256(token),
+      ip: clientKey(req.ip),
+      files: started,
+      totalSize: checked.totalSize,
+      expiryMinutes: checked.expiryMinutes,
+      maxDownloads: checked.maxDownloads,
+    });
+    res.status(201).json({ uploadToken: token, files: answer });
+  } catch (e) {
+    console.error('Direct upload start failed:', e);
+    await Promise.all(started.map((f) => provider.abortDirect(f.storageKey, f.uploadId)));
+    res.status(500).json({ error: 'Could not start the upload. Please try again.' });
+  }
+});
+
+router.post('/direct/complete', directLimiter, async (req, res) => {
+  const token = typeof req.body?.uploadToken === 'string' ? req.body.uploadToken : '';
+  // Taken (and removed) in one step, so a second "done" for the same upload cannot create a second transfer.
+  const pending = token ? await PendingUpload.findOneAndDelete({ tokenHash: sha256(token) }) : null;
+  if (!pending) return res.status(404).json({ error: 'This upload has expired. Please try again.' });
+
+  const provider = storage.get('s3');
+  const joined = [];
+  try {
+    for (const f of pending.files) {
+      const sizes = Array.from({ length: Math.max(1, Math.ceil(f.size / provider.partSize)) }, (_, i) =>
+        Math.min(provider.partSize, f.size - i * provider.partSize)
+      );
+      const finalSize = await provider.finishDirect(f.storageKey, f.uploadId, sizes);
+      joined.push(f.storageKey);
+      if (finalSize !== f.size) throw Object.assign(new Error('Size mismatch'), { code: 'PART_MISMATCH' });
+    }
+
+    const transfer = await Transfer.create({
+      key: await generateKey(),
+      storage: 's3',
+      files: pending.files.map((f) => ({ originalName: f.name, storageKey: f.storageKey, size: f.size, mimeType: f.mimeType })),
+      fileCount: pending.files.length,
+      totalSize: pending.totalSize,
+      maxDownloads: pending.maxDownloads,
+      expiresAt: new Date(Date.now() + pending.expiryMinutes * 60 * 1000),
+    });
+    res.status(201).json(publicView(transfer));
+  } catch (e) {
+    // Nothing half-finished is kept: joined files are deleted, the others are aborted.
+    await Promise.all(
+      pending.files.map((f) =>
+        joined.includes(f.storageKey) ? provider.remove(f.storageKey) : provider.abortDirect(f.storageKey, f.uploadId)
+      )
+    );
+    if (e.code === 'PART_MISMATCH' || e.name === 'NoSuchUpload' || e.name === 'InvalidPart') {
+      return res.status(400).json({ error: 'The upload did not finish correctly. Please try again.' });
+    }
+    console.error('Direct upload complete failed:', e);
+    res.status(500).json({ error: 'Could not store the files. Please try again.' });
+  }
+});
+
+router.post('/direct/abort', directLimiter, async (req, res) => {
+  const token = typeof req.body?.uploadToken === 'string' ? req.body.uploadToken : '';
+  const pending = token ? await PendingUpload.findOneAndDelete({ tokenHash: sha256(token) }) : null;
+  if (pending) {
+    const provider = storage.get('s3');
+    await Promise.all(pending.files.map((f) => provider.abortDirect(f.storageKey, f.uploadId)));
+  }
+  res.json({ success: true });
 });
 
 router.post('/', uploadLimiter, async (req, res) => {
@@ -305,6 +447,8 @@ router.post('/:key/email', lookupLimiter, guard.keyGuard, async (req, res) => {
 });
 
 // Headers shared by every file response: never rendered, never sniffed, never cached.
+const DOWNLOAD_LINK_SECONDS = 30; // a signed download link must be used within this time to start
+
 const downloadHeaders = (res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
@@ -320,12 +464,13 @@ router.get('/:key/zip', zipLimiter, guard.keyGuard, async (req, res) => {
       res.set('Retry-After', '5');
       return res.status(503).json({ error: 'Too many zips are being prepared. Please try again in a moment.' });
     }
+    // Prepared before the downloads are counted, so a setup error never uses up anyone's downloads.
+    const provider = storage.get(transfer.storage);
+    const archive = createZip({ zlib: { level: 6 } });
     if (!(await claimAll(transfer))) {
       return res.status(429).json({ error: 'Some files have used all their downloads. Download the remaining files one by one.' });
     }
 
-    const provider = storage.get(transfer.storage);
-    const archive = archiver('zip', { zlib: { level: 6 } });
     archive.on('error', () => res.destroy());
     res.on('close', () => archive.abort()); // stop reading files when the client leaves
     downloadHeaders(res);
@@ -356,11 +501,33 @@ router.get('/:key/files/:index', lookupLimiter, guard.keyGuard, async (req, res)
     if (!transfer) return;
     const file = /^\d{1,2}$/.test(req.params.index) ? transfer.files[Number(req.params.index)] : null;
     if (!file) return res.status(404).json({ error: 'File not found or the key has expired.' });
+
+    // HEAD only asks about the file (link checkers, some download managers): answer, but never count it.
+    if (req.method === 'HEAD') {
+      res.setHeader('Content-Type', guard.safeMime(file.mimeType));
+      res.setHeader('Content-Length', file.size);
+      res.setHeader('Cache-Control', 'private, no-store');
+      return res.end();
+    }
+
     if (!(await claimFile(transfer, Number(req.params.index)))) {
       return res.status(429).json({ error: 'This file has already been downloaded the allowed number of times.' });
     }
 
-    const stream = await storage.get(transfer.storage).read(file.storageKey);
+    // S3: send the browser straight to S3 with a 30-second signed link, so the bytes never pass through
+    // this server. The download was counted above, and the link itself is never shown on any page.
+    const provider = storage.get(transfer.storage);
+    if (provider.downloadUrl) {
+      try {
+        const url = await provider.downloadUrl(file.storageKey, guard.safeFileName(file.originalName), guard.safeMime(file.mimeType), DOWNLOAD_LINK_SECONDS);
+        res.setHeader('Cache-Control', 'private, no-store');
+        return res.redirect(302, url);
+      } catch (e) {
+        console.error('Signed download link failed, streaming instead:', e.message);
+      }
+    }
+
+    const stream = await provider.read(file.storageKey);
     downloadHeaders(res);
     res.attachment(guard.safeFileName(file.originalName));
     res.setHeader('Content-Type', guard.safeMime(file.mimeType));
